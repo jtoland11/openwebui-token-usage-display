@@ -1128,6 +1128,7 @@ class Filter:
             "is_anthropic": False,
             "input_has_cache": False,
             "fresh_input": None,
+            "context_used": None,
             "cumulative": None,
             "cumulative_est": False,
         }
@@ -1168,6 +1169,10 @@ class Filter:
 
         # Derived total: fresh input + cache (read+write) + output — correct for every shape.
         result["total"] = self._compute_total(result)
+
+        # Context-window occupancy (the "used" side of the 📐 metric): the LAST
+        # round's request, not the cross-round sum — see _last_round_context.
+        result["context_used"] = self._last_round_context(usage, result)
 
         # Running chat total — derived after `total`, so the current turn counts exactly as displayed.
         cumulative = self._cumulative_tokens(messages, assistant_msg, result)
@@ -1244,6 +1249,33 @@ class Filter:
             "input_has_cache": input_has_cache,
             "fresh_input": fresh_input,
         }
+
+    @staticmethod
+    def _last_round_context(usage: dict[str, Any] | None, result: dict[str, Any]) -> int | None:
+        """Tokens occupying the model's context window at the end of the turn.
+
+        For a multi-round (tool/agent) turn OWUI's merge_usage SUMS input_tokens/
+        total_tokens across every LLM round-trip while keeping prompt_tokens/
+        completion_tokens at the LAST round's values. The window is filled by the
+        last request (+its output), not by the sum of every earlier round's prompt
+        — so using the summed total over-counts the "used" side (e.g. 301% on a
+        4-round agent over an 8k window). prompt_tokens is the last round for every
+        provider (merge_usage always rewrites it from the incoming round), and for a
+        single round it equals input_tokens. Anthropic-native reports input
+        EXCLUDING cache (input_has_cache False), so its cache tokens are added back
+        — they occupy the window. Falls back to None (caller uses the summed total)
+        when no per-round prompt is available, e.g. the tiktoken-estimate path.
+        """
+        if not isinstance(usage, dict):
+            return None
+        last_prompt = _first_num(usage, "prompt_tokens", "input_tokens")
+        last_completion = _first_num(usage, "completion_tokens", "output_tokens")
+        if last_prompt is None and last_completion is None:
+            return None
+        used = (last_prompt or 0) + (last_completion or 0)
+        if not result.get("input_has_cache"):
+            used += (result.get("cached") or 0) + (result.get("cache_write") or 0)
+        return int(used)
 
     def _compute_total(self, result: dict[str, Any]) -> int | None:
         """Total tokens = fresh input + cache (read + write) + output.
@@ -1381,7 +1413,13 @@ class Filter:
         if not self.valves.show_context_window:
             return {"size": None, "used": None, "source": "disabled", "matched_key": None}
 
-        used = tokens["total"]
+        # Window utilization is the LAST round's request, not the cross-round Σ:
+        # merge_usage sums input/total over every tool round, which would read as
+        # "sent tokens way too high" (and >100%) for multi-round turns. Fall back
+        # to the summed total only when the per-round prompt is unavailable.
+        used = tokens.get("context_used")
+        if used is None:
+            used = tokens["total"]
         if used is None:
             used = (tokens["input"] or 0) + (tokens["output"] or 0) or None
 
